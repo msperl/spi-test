@@ -22,6 +22,11 @@
 #include <linux/of_device.h>
 #include <linux/spi/spi.h>
 
+int simulate_only = 0;
+module_param(simulate_only, int, 0);
+int dump_messages = 0;
+module_param(dump_messages, int, 0);
+
 #define SPI_TEST_MAX_TRANSFERS 4
 #define SPI_TEST_MAX_SIZE (32 * PAGE_SIZE)
 #define SPI_TEST_MAX_ITERATE 12
@@ -31,9 +36,12 @@
 #define TX_START	(2<<30)
 #define TX(off)		((void *)(TX_START + off))
 
+static int spi_test_execute_msg(struct spi_device *spi,
+				struct spi_message *msg);
+
 /* describes a specific (set of) tests to get executed */
 struct spi_test {
-	char *description;	/* a description of the test */
+	char description[64];	/* a description of the test */
 	/* iterate over all the non-zero values */
 	int iterate_len[SPI_TEST_MAX_ITERATE]; /* set the transfer length  */
 	int iterate_tx_off[SPI_TEST_MAX_ITERATE]; /* shift tx_buff by this */
@@ -106,7 +114,37 @@ static struct spi_test spi_tests[] = {
 	{ }
 };
 
-static int spi_test_translate(void **ptr, size_t len, void *tx, void *rx)
+static void spi_test_dump_message(struct spi_device *spi,
+				  struct spi_message *msg)
+{
+	struct spi_transfer *xfer;
+
+	dev_info(&spi->dev,"  spi_msg@%pK\n", msg);
+
+	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
+		dev_info(&spi->dev, "    spi_transfer@%pK\n", xfer);
+		dev_info(&spi->dev, "      len:    %i\n", xfer->len);
+		dev_info(&spi->dev, "      tx_buf: %pK\n", xfer->tx_buf);
+		dev_info(&spi->dev, "      rx_buf: %pK\n", xfer->rx_buf);
+	}
+}
+
+static int spi_test_execute_msg(struct spi_device *spi,
+				struct spi_message *msg)
+{
+	int ret;
+	if (dump_messages)
+		spi_test_dump_message(spi, msg);
+
+	if (simulate_only)
+		return 0;
+
+	return spi_sync(spi, msg);
+}
+
+static int spi_test_translate(struct spi_device *spi,
+			      void **ptr, size_t len,
+			      void *tx, void *rx)
 {
 	size_t off;
 
@@ -115,32 +153,26 @@ static int spi_test_translate(void **ptr, size_t len, void *tx, void *rx)
 		return 0;
 
 	/* RX range */
-	if (*ptr >= RX(0)) {
+	if ((*ptr >= RX(0)) && ( *ptr + len < RX(SPI_TEST_MAX_SIZE))) {
 		off = *ptr - RX(0);
-		if (off >= SPI_TEST_MAX_SIZE) {
-			return -EINVAL;
-		}
-		if (off + len >= SPI_TEST_MAX_SIZE) {
-			return -EINVAL;
-		}
 		*ptr = rx + off;
 
 		return 0;
 	}
 
 	/* TX range */
-	if (*ptr >= TX(0)) {
+	if ((*ptr >= TX(0)) && ( *ptr + len < TX(SPI_TEST_MAX_SIZE))) {
 		off = *ptr - TX(0);
-		if (off >= SPI_TEST_MAX_SIZE) {
-			return -EINVAL;
-		}
-		if (off + len >= SPI_TEST_MAX_SIZE) {
-			return -EINVAL;
-		}
 		*ptr = tx + off;
 
 		return 0;
 	}
+
+	dev_err(&spi->dev,
+		"PointerRange [%pK:%pK[ not in range [%pK:%pK[ or [%pK:%pK[\n",
+		*ptr, *ptr + len,
+		RX(0), RX(SPI_TEST_MAX_SIZE),
+		TX(0), TX(SPI_TEST_MAX_SIZE));
 
 	return -EINVAL;
 }
@@ -215,7 +247,7 @@ static int spi_test_fill_tx(struct spi_test *test,
 				dev_err(&spi->dev,
 					"unsupported fill_option: %i\n",
 					test->fill_option);
-				return 1;
+				return -EINVAL;
 			}
 		}
 	}
@@ -224,9 +256,9 @@ static int spi_test_fill_tx(struct spi_test *test,
 }
 
 
-static int _spi_test_run(struct spi_device *spi,
-			 void *tx, void *rx,
-			 struct spi_test *test)
+int _spi_test_run(struct spi_device *spi,
+		  struct spi_test *test,
+		  void *tx, void *rx)
 {
 	struct spi_message msg; /* ideally we could use test.message */
 	struct spi_transfer *x;
@@ -238,7 +270,7 @@ static int _spi_test_run(struct spi_device *spi,
 			"Exceeded max number of allowed transfers of %i with %i\n",
 			SPI_TEST_MAX_TRANSFERS,
 			test->transfers);
-		return -EINVAL;
+		return -E2BIG;
 	}
 
 	/* initialize message */
@@ -251,12 +283,12 @@ static int _spi_test_run(struct spi_device *spi,
 		memcpy(x, &test->xfers[i], sizeof(*x));
 
 		/* patch the values of rx_buf/tx_buf */
-		ret = spi_test_translate((void **)&x->tx_buf, x->len,
+		ret = spi_test_translate(spi, (void **)&x->tx_buf, x->len,
 					 (void *)tx, rx);
 		if (ret)
 			return ret;
 
-		ret = spi_test_translate(&x->rx_buf, x->len,
+		ret = spi_test_translate(spi, &x->rx_buf, x->len,
 					 (void *)tx, rx);
 		if (ret)
 			return ret;
@@ -273,7 +305,7 @@ static int _spi_test_run(struct spi_device *spi,
 	if (test->test)
 		ret = test->test(test, spi, &msg, tx, rx);
 	else
-		ret = spi_sync(spi, &msg);
+		ret = spi_test_execute_msg(spi, &msg);
 
 	/* handle result */
 	if (ret == test->expected_return)
@@ -286,81 +318,84 @@ static int _spi_test_run(struct spi_device *spi,
 	if (ret)
 		return ret;
 
-	/* if it is 0 (as we expected something else,
+	/* if it is 0, as we expected something else,
 	 * then return something special
 	 */
-	return -9999;
+	return -EFAULT;
 }
 
 static int spi_test_run_iter(struct spi_device *spi,
+			     const struct spi_test *testtemplate,
 			     void *tx, void *rx,
-			     struct spi_test *test,
 			     size_t len,
 			     size_t tx_off,
 			     size_t rx_off
 	)
 {
-	struct spi_transfer *xfer;
+	struct spi_test test;
 	int i;
 
-	/* fill in the values */
-	for(i = 0; i < test->transfers; i++) {
-		xfer = & test->xfers[i];
-		if (len)
-			xfer->len = len;
-		if (tx_off && xfer->tx_buf)
-			xfer->tx_buf += tx_off;
-		if (rx_off && xfer->rx_buf)
-			xfer->rx_buf += rx_off;
-	}
-	/* and execute */
-	if (len || tx_off || rx_off) {
-		dev_info(&spi->dev,
-			"Running test %s with len = %i, tx_off = %i, rx_off = %i\n",
-			test->description,
-			len, tx_off, rx_off);
+	/* copy the test template to test */
+	memcpy(&test, testtemplate, sizeof(test));
 
-	} else {
+	/* write out info */
+	if (!(len || tx_off || rx_off)) {
 		dev_info(&spi->dev,
 			"Running test %s\n",
-			test->description);
+			test.description);
+	} else {
+		dev_info(&spi->dev,
+			"  with iteration values: len = %i, tx_off = %i, rx_off = %i\n",
+			len, tx_off, rx_off);
 	}
 
-	return _spi_test_run(spi, tx, rx, test);
+
+	/* fill in the values from iterations - if set...*/
+	for(i = 0; i < test.transfers; i++) {
+		if (len)
+			test.xfers[i].len = len;
+		if (tx_off && test.xfers[i].tx_buf)
+			test.xfers[i].tx_buf += tx_off;
+		if (rx_off && test.xfers[i].rx_buf)
+			test.xfers[i].rx_buf += rx_off;
+	}
+
+	/* and execute */
+	return _spi_test_run(spi, &test, tx, rx);
 }
 
 static int spi_test_run(struct spi_device *spi,
 			void *tx, void *rx,
-			const struct spi_test *tt)
+			const struct spi_test *test)
 {
-	struct spi_test test;
 	int idx_len, idx_tx_off, idx_rx_off;
 	size_t len, tx_off, rx_off;
 	int ret;
 
-	/* iterate over all the values */
-	for(idx_len = -1;
-	    (idx_len < SPI_TEST_MAX_ITERATE) &&
-	    (tt->iterate_len[idx_len]);
-	    idx_len++) {
-		len = (idx_len > -1) ? tt->iterate_len[idx_len] : 0;
-		for(idx_tx_off = -1;
-		    (idx_tx_off < SPI_TEST_MAX_ITERATE) &&
-		    (tt->iterate_len[idx_tx_off]);
-		    idx_tx_off++) {
-			tx_off = (idx_tx_off > -1) ?
-				tt->iterate_tx_off[idx_len] : 0;
-			for(idx_rx_off = -1;
-			    (idx_rx_off < SPI_TEST_MAX_ITERATE) &&
-				    (tt->iterate_len[idx_rx_off]);
-			    idx_rx_off++) {
-				rx_off = (idx_rx_off > -1) ?
-					tt->iterate_rx_off[idx_len] : 0;
-				/* copy the test template to test */
-				memcpy(&test, tt, sizeof(test));
-				/* and run the iteration with this copy */
-				ret = spi_test_run_iter(spi, tx, rx,
-							&test,
+	if (test->iterate_len[0] ||
+	    test->iterate_rx_off[0] ||
+	    test->iterate_rx_off[0]) {
+		dev_info(&spi->dev,"Running test %s with iterations\n",
+			 test->description);
+	}
+
+	/* iterate over all the iterable values using a macro */
+#define FOR_EACH_ITERATE(var, defaultvalue)				\
+	for (idx_##var = -1, var = defaultvalue;			\
+	     ((idx_##var < 0) ||					\
+		     (							\
+			     (idx_##var < SPI_TEST_MAX_ITERATE) &&	\
+			     (var = test->iterate_##var[idx_##var])	\
+		     )							\
+       	     );								\
+	     idx_##var ++)
+
+	FOR_EACH_ITERATE(len, 0) {
+		FOR_EACH_ITERATE(tx_off, 0) {
+			FOR_EACH_ITERATE(rx_off, 0) {
+				/* and run the iteration */
+				ret = spi_test_run_iter(spi, test,
+							tx, rx,
 							len,
 							tx_off,
 							rx_off);
@@ -377,18 +412,20 @@ static int spi_test_probe(struct spi_device *spi)
 {
 	char *rx = NULL, *tx = NULL;
 	int ret = 0;
-	struct spi_test *test = spi_tests;
+	struct spi_test *test;
+
+	dev_info(&spi->dev, "Executing spi-tests\n");
 
 	/* allocate rx/tx buffers of 128kB size without devm
 	 * in the hope that is on a page boundry
 	 */
-	rx = kzalloc(32 * PAGE_SIZE, GFP_KERNEL);
+	rx = kzalloc(SPI_TEST_MAX_SIZE, GFP_KERNEL);
 	if (!rx) {
 		ret = -ENOMEM;
 		goto out;
 	}
 
-	tx = devm_kzalloc(&spi->dev, 32 * PAGE_SIZE, GFP_KERNEL);
+	tx = kzalloc(SPI_TEST_MAX_SIZE, GFP_KERNEL);
 	if (!tx) {
 		ret = -ENOMEM;
 		goto out;
@@ -402,6 +439,7 @@ static int spi_test_probe(struct spi_device *spi)
 	}
 
 out:
+	dev_info(&spi->dev, "Finished spi-tests with exit %i\n", ret);
 	kfree(rx);
 	kfree(tx);
 
@@ -411,7 +449,7 @@ out:
 /* define the match table */
 static struct of_device_id spi_test_of_match[] = {
 	{
-		.compatible	= "to-override",
+		.compatible	= "linux,spi-test",
 	},
 	{ }
 };
