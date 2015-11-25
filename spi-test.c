@@ -17,7 +17,10 @@
  *  GNU General Public License for more details.
  */
 
+#include <linux/delay.h>
 #include <linux/kernel.h>
+#include <linux/list.h>
+#include <linux/list_sort.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/printk.h>
@@ -26,9 +29,11 @@
 /* flag to only simulate transfers */
 int simulate_only;
 module_param(simulate_only, int, 0);
+
 /* dump spi messages */
 int dump_messages;
 module_param(dump_messages, int, 0);
+
 /* the device is jumpered for loopback - enabling some rx_buf tests */
 int loopback;
 module_param(loopback, int, 0);
@@ -45,11 +50,23 @@ module_param(loopback, int, 0);
 #define RX(off)		((void *)(RX_START + off))
 #define TX(off)		((void *)(TX_START + off))
 
+#define RANGE_CHECK(ptr, plen, start, slen) \
+	((ptr >= start) && (ptr + plen < start + slen))
+
 /* we allocate one page more, to allow for offsets */
 #define SPI_TEST_MAX_SIZE_PLUS (SPI_TEST_MAX_SIZE + PAGE_SIZE)
 
+/* detection pattern for unfinished reads...
+ * - 0x00 or 0xff could be valid levels for tx_buf = NULL,
+ * so we do not use either of them
+ */
+#define SPI_TEST_PATTERN_UNWRITTEN 0xAA
+#define SPI_TEST_PATTERN_DO_NOT_WRITE 0x55
+#define SPI_TEST_CHECK_DO_NOT_WRITE 64
+
 static int spi_test_execute_msg(struct spi_device *spi,
-				struct spi_message *msg);
+				struct spi_message *msg,
+				void *tx, void *rx);
 
 /* describes a specific (set of) tests to get executed */
 struct spi_test {
@@ -143,11 +160,34 @@ static struct spi_test spi_tests[] = {
 	{ /* end of tests sequence */ }
 };
 
+static void spi_test_print_hex_dump(char *pre, const void *ptr, size_t len)
+{
+	/* limit the hex_dump */
+	if (len < 1024) {
+		print_hex_dump(KERN_INFO, pre,
+			       DUMP_PREFIX_OFFSET, 16, 1,
+			       ptr, len, 0);
+		return;
+	}
+	/* print head */
+	print_hex_dump(KERN_INFO, pre,
+		       DUMP_PREFIX_OFFSET, 16, 1,
+		       ptr, 512, 0);
+	/* print tail */
+	pr_info("%s truncated - continuing at offset %04x\n",
+		pre, len - 512);
+	print_hex_dump(KERN_INFO, pre,
+		       DUMP_PREFIX_OFFSET, 16, 1,
+		       ptr + (len - 512), 512, 0);
+}
+
 static void spi_test_dump_message(struct spi_device *spi,
 				  struct spi_message *msg,
 				  bool dump_data)
 {
 	struct spi_transfer *xfer;
+	int i;
+	u8 b;
 
 	dev_info(&spi->dev, "  spi_msg@%pK\n", msg);
 	if (msg->status)
@@ -163,20 +203,117 @@ static void spi_test_dump_message(struct spi_device *spi,
 		dev_info(&spi->dev, "      len:    %i\n", xfer->len);
 		dev_info(&spi->dev, "      tx_buf: %pK\n", xfer->tx_buf);
 		if (dump_data && xfer->tx_buf)
-			print_hex_dump(KERN_INFO, "          TX: ",
-				       DUMP_PREFIX_OFFSET, 16, 1,
-				       xfer->tx_buf, xfer->len, 0);
+			spi_test_print_hex_dump("          TX: ",
+						xfer->tx_buf,
+						xfer->len);
 
 		dev_info(&spi->dev, "      rx_buf: %pK\n", xfer->rx_buf);
 		if (dump_data && xfer->rx_buf)
-			print_hex_dump(KERN_INFO, "          RX: ",
-				       DUMP_PREFIX_OFFSET, 16, 1,
-				       xfer->tx_buf, xfer->len, 0);
+			spi_test_print_hex_dump("          RX: ",
+						xfer->rx_buf,
+						xfer->len);
+		/* check for unwritten test pattern on rx_buf */
+		if (xfer->rx_buf) {
+			for (i = 0 ; i < xfer->len ; i++) {
+				b = ((u8 *)xfer->rx_buf)[xfer->len - 1 - i];
+				if (b != SPI_TEST_PATTERN_UNWRITTEN)
+					break;
+			}
+			if (i)
+				dev_info(&spi->dev,
+					 "      rx_buf filled with %02x starts at offset: %i\n",
+					 SPI_TEST_PATTERN_UNWRITTEN,
+					 xfer->len - i);
+		}
 	}
 }
 
+struct rx_ranges {
+	struct list_head list;
+	u8 *start;
+	u8 *end;
+};
+
+int rx_ranges_cmp(void *priv, struct list_head *a, struct list_head *b)
+{
+	struct rx_ranges *rx_a = list_entry(a, struct rx_ranges, list);
+	struct rx_ranges *rx_b = list_entry(b, struct rx_ranges, list);
+
+	if (rx_a->start > rx_b->start)
+		return 1;
+	if (rx_a->start < rx_b->start)
+		return -1;
+	return 0;
+}
+
+static int spi_check_rx_ranges(struct spi_device *spi,
+			       struct spi_message *msg,
+			       void *rx)
+{
+	struct spi_transfer *xfer;
+	struct rx_ranges ranges[SPI_TEST_MAX_TRANSFERS], *r;
+	int i = 0;
+	LIST_HEAD(ranges_list);
+	u8 *addr;
+	int ret = 0;
+
+	/* loop over all transfers to fill in the rx_ranges */
+	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
+		/* if there is no rx, then no check is needed */
+		if (!xfer->rx_buf)
+			continue;
+		/* fill in the rx_range */
+		if (RANGE_CHECK(xfer->rx_buf, xfer->len,
+				rx, SPI_TEST_MAX_SIZE_PLUS)) {
+			ranges[i].start = xfer->rx_buf;
+			ranges[i].end = xfer->rx_buf + xfer->len;
+			list_add(&ranges[i].list, &ranges_list);
+			i++;
+		}
+	}
+
+	/* if no ranges, then we can return and avoid the checks...*/
+	if (!i)
+		return 0;
+
+	/* sort the list */
+	list_sort(NULL, &ranges_list, rx_ranges_cmp);
+
+	/* and iterate over all the rx addresses */
+	for (addr = rx; addr < (u8 *)rx + SPI_TEST_MAX_SIZE_PLUS; addr++) {
+		/* if we are the DO not write pattern,
+		 * then continue with the loop...
+		 */
+		if (*addr == SPI_TEST_PATTERN_DO_NOT_WRITE)
+			continue;
+
+		/* check if we are inside a range */
+		list_for_each_entry(r, &ranges_list, list) {
+			/* if so then set to end... */
+			if ((addr >= r->start) && (addr < r->end))
+				addr = r->end;
+		}
+		/* second test after a (hopefull) translation */
+		if (*addr == SPI_TEST_PATTERN_DO_NOT_WRITE)
+			continue;
+
+		/* if still not found then something has modified too much */
+		/* we could list the "closest" transfer here... */
+		dev_err(&spi->dev,
+			"loopback strangeness - rx changed outside of allowed range at: %pK\n",
+			addr);
+		/* do not return, only set ret,
+		 * so that we list all addresses
+		 */
+		ret = -ERANGE;
+	}
+
+	return ret;
+}
+
 static int spi_test_check_loopback_result(struct spi_device *spi,
-					  struct spi_message *msg)
+					  struct spi_message *msg,
+					  void *tx, void *rx)
 {
 	struct spi_transfer *xfer;
 	u8 rxb, txb;
@@ -213,18 +350,19 @@ static int spi_test_check_loopback_result(struct spi_device *spi,
 		}
 	}
 
-	return 0;
+	return spi_check_rx_ranges(spi, msg, rx);
 
 mismatch_error:
 	dev_err(&spi->dev,
-		"loopback strangeness - transfer missmatch on byte %i - expected 0x%02x, but got 0x%02x\n",
+		"loopback strangeness - transfer missmatch on byte %04x - expected 0x%02x, but got 0x%02x\n",
 		i, txb, rxb);
 
 	return -EINVAL;
 }
 
 static int spi_test_execute_msg(struct spi_device *spi,
-				struct spi_message *msg)
+				struct spi_message *msg,
+				void *tx, void *rx)
 {
 	int ret = 0;
 
@@ -248,7 +386,8 @@ static int spi_test_execute_msg(struct spi_device *spi,
 
 		/* run rx-tests when in loopback mode */
 		if (loopback)
-			ret = spi_test_check_loopback_result(spi, msg);
+			ret = spi_test_check_loopback_result(spi, msg,
+							     tx, rx);
 	}
 
 	/* if requested or on error dump message (including data) */
@@ -271,7 +410,7 @@ static int spi_test_translate(struct spi_device *spi,
 		return 0;
 
 	/* RX range */
-	if ((*ptr >= RX(0)) && (*ptr + len <= RX(SPI_TEST_MAX_SIZE_PLUS))) {
+	if (RANGE_CHECK(*ptr, len,  RX(0), SPI_TEST_MAX_SIZE_PLUS)) {
 		off = *ptr - RX(0);
 		*ptr = rx + off;
 
@@ -279,7 +418,7 @@ static int spi_test_translate(struct spi_device *spi,
 	}
 
 	/* TX range */
-	if ((*ptr >= TX(0)) && (*ptr + len <= TX(SPI_TEST_MAX_SIZE_PLUS))) {
+	if (RANGE_CHECK(*ptr, len,  TX(0), SPI_TEST_MAX_SIZE_PLUS)) {
 		off = *ptr - TX(0);
 		*ptr = tx + off;
 
@@ -299,7 +438,7 @@ static int spi_test_fill_tx(struct spi_test *test, struct spi_device *spi)
 {
 	struct spi_transfer *xfers = test->transfers;
 	u8 *tx_buf;
-	size_t len, count = 0;
+	size_t count = 0;
 	int i, j;
 
 #ifdef __BIG_ENDIAN
@@ -316,9 +455,9 @@ static int spi_test_fill_tx(struct spi_test *test, struct spi_device *spi)
 		tx_buf = (u8 *)xfers[i].tx_buf;
 		if (!tx_buf)
 			continue;
-		len = xfers[i].len;
 		/* modify all the transfers */
-		for (j = 0; j < len; j++, tx_buf++, count++) {
+		for (j = 0; j < xfers[i].len; j++, tx_buf++, count++) {
+			/* fill tx */
 			switch (test->fill_option) {
 			case FILL_MEMSET_8:
 				*tx_buf = test->fill;
@@ -366,6 +505,10 @@ static int spi_test_fill_tx(struct spi_test *test, struct spi_device *spi)
 				return -EINVAL;
 			}
 		}
+		/* fill rx_buf with SPI_TEST_PATTERN_UNWRITTEN */
+		if (xfers[i].rx_buf)
+			memset(xfers[i].rx_buf, SPI_TEST_PATTERN_UNWRITTEN,
+			       xfers[i].len);
 	}
 
 	return 0;
@@ -381,6 +524,11 @@ int _spi_test_run(struct spi_device *spi,
 
 	/* initialize message */
 	spi_message_init(&msg);
+
+	/* fill rx with DO_NOT_WRITE pattern if we got a single transfer */
+	if (test->transfer_count == 1)
+		memset(rx, SPI_TEST_PATTERN_DO_NOT_WRITE,
+		       SPI_TEST_MAX_SIZE_PLUS);
 
 	/* add the individual transfers */
 	for (i = 0; i < test->transfer_count; i++) {
@@ -411,7 +559,7 @@ int _spi_test_run(struct spi_device *spi,
 	if (test->test)
 		ret = test->test(test, spi, &msg, tx, rx);
 	else
-		ret = spi_test_execute_msg(spi, &msg);
+		ret = spi_test_execute_msg(spi, &msg, tx, rx);
 
 	/* handle result */
 	if (ret == test->expected_return)
@@ -579,6 +727,8 @@ static int spi_test_probe(struct spi_device *spi)
 		goto out;
 	}
 
+	pr_info("XXX rx=%pK\n", rx);
+	pr_info("YYY tx=%pK\n", tx);
 	/* now run the individual tests in the table */
 	for (test = spi_tests; test->description[0]; test = &test[1]) {
 		ret = spi_test_run(spi, tx, rx, test);
@@ -596,7 +746,7 @@ out:
 
 /* non const match table to permit to change via a module parameter */
 static struct of_device_id spi_test_of_match[] = {
-	{ .compatible	= "spi,loopback-test", },
+	{ .compatible	= "linux,spi-loopback-test", },
 	{ }
 };
 
